@@ -1,0 +1,90 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run All Microservices",
+			"dependsOn": [
+                "Run ns",
+				"Run cliente_01",
+				"Run cliente_02",
+				"Run cliente_03",
+				"Run cliente_04"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"presentation": {
+				"panel": "new",
+				"reveal": "always"
+			},
+			"runOptions": {
+				"runOn": "default"
+			}
+		},
+		{
+			"label": "Run ns",
+			"type": "shell",
+			"command": "pyro5-ns",
+			"args": [
+				""
+			],
+			"isBackground": true,
+			"presentation": {
+				"group": "server_group"
+			}
+		},
+		{
+			"label": "Run cliente_01",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"client.py",
+				"cliente_01" 
+			],
+			"isBackground": true,
+			"presentation": {
+				"group": "cliente_group"
+			}
+		},
+		{
+			"label": "Run cliente_02",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"client.py",
+				"cliente_02" 
+			],
+			"isBackground": true,
+			"presentation": {
+				"group": "cliente_group"
+			}
+		},
+		{
+			"label": "Run cliente_03",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"client.py",
+				"cliente_03" 
+			],
+			"isBackground": true,
+			"presentation": {
+				"group": "cliente_group"
+			}
+		},
+		{
+			"label": "Run cliente_04",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"client.py",
+				"cliente_04" 
+			],
+			"isBackground": true,
+			"presentation": {
+				"group": "cliente_group"
+			}
+		}
+	]
+}
