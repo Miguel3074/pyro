@@ -5,10 +5,10 @@
 			"label": "Run All Microservices",
 			"dependsOn": [
                 "Run ns",
-				"Run cliente_01",
-				"Run cliente_02",
-				"Run cliente_03",
-				"Run cliente_04"
+				"Run peerA",
+				"Run peerB",
+				"Run peerC",
+				"Run peerD"
 			],
 			"group": {
 				"kind": "build",
@@ -35,12 +35,12 @@
 			}
 		},
 		{
-			"label": "Run cliente_01",
+			"label": "Run peerA",
 			"type": "shell",
 			"command": "python",
 			"args": [
 				"client.py",
-				"cliente_01" 
+				"peerA" 
 			],
 			"isBackground": true,
 			"presentation": {
@@ -48,12 +48,12 @@
 			}
 		},
 		{
-			"label": "Run cliente_02",
+			"label": "Run peerB",
 			"type": "shell",
 			"command": "python",
 			"args": [
 				"client.py",
-				"cliente_02" 
+				"peerB" 
 			],
 			"isBackground": true,
 			"presentation": {
@@ -61,12 +61,12 @@
 			}
 		},
 		{
-			"label": "Run cliente_03",
+			"label": "Run peerC",
 			"type": "shell",
 			"command": "python",
 			"args": [
 				"client.py",
-				"cliente_03" 
+				"peerC" 
 			],
 			"isBackground": true,
 			"presentation": {
@@ -74,12 +74,12 @@
 			}
 		},
 		{
-			"label": "Run cliente_04",
+			"label": "Run peerD",
 			"type": "shell",
 			"command": "python",
 			"args": [
 				"client.py",
-				"cliente_04" 
+				"peerD" 
 			],
 			"isBackground": true,
 			"presentation": {
