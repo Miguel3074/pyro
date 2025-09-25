@@ -177,29 +177,6 @@ class ClienteHandle(object):
                 del self.pedidos_pendentes[remetente_id]
         print(f"Recebeu OK de {remetente_id}")
         return "ACK"
-    
-    @Pyro5.api.expose
-    def encaminhar_notificacao(self, destinatario_id, remetente_id):
-        try:
-            if destinatario_id == CLIENTE_ID:
-                with self.lock:
-                    self.respostas_recebidas.add(remetente_id)
-                    if remetente_id in self.pedidos_pendentes:
-                        del self.pedidos_pendentes[remetente_id]
-                print(f"Recebeu OK encaminhado de {remetente_id}")
-                return "ACK"
-            else:
-                ns = Pyro5.api.locate_ns()
-                nome_destinatario = f"cliente.exclusao_mutua.{destinatario_id}"
-                uri_destinatario = ns.lookup(nome_destinatario)
-                proxy_destinatario = Pyro5.api.Proxy(uri_destinatario)
-                proxy_destinatario._pyroTimeout = TIMEOUT_RESPOSTA
-                proxy_destinatario.receber_ok(remetente_id)
-                print(f"Encaminhou notificação de {remetente_id} para {destinatario_id}")
-                return "ACK"
-        except Exception as e:
-            print(f"Erro ao encaminhar notificação: {e}")
-            return "ERROR"
 
     def verificar_timeouts_respostas(self, peers_esperados):
         tempo_atual = time.time()
@@ -269,25 +246,6 @@ class ClienteHandle(object):
         except Exception as e:
             print(f"Erro ao processar notificações pendentes: {e}")
     
-    def tentar_notificacao_broadcast(self, requisitante_id):
-        try:
-            print(f"Tentando notificação via broadcast para {requisitante_id}...")
-            ns = Pyro5.api.locate_ns()
-            peers = ns.list(prefix="cliente.exclusao_mutua.")
-            peers.pop(NOME_OBJETO_PYRO, None)
-            
-            for nome_peer, uri_peer in peers.items():
-                try:
-                    proxy_peer = Pyro5.api.Proxy(uri_peer)
-                    proxy_peer._pyroTimeout = TIMEOUT_RESPOSTA
-                    proxy_peer.encaminhar_notificacao(requisitante_id, CLIENTE_ID)
-                    print(f"Notificação via broadcast enviada via {nome_peer.split('.')[-1]}")
-                    break
-                except Exception as e:
-                    continue
-                    
-        except Exception as e:
-            print(f"Erro no broadcast para {requisitante_id}: {e}")
 
     def parar_heartbeat(self):
         print("Parando threads de heartbeat...")
