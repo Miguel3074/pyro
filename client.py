@@ -1,419 +1,317 @@
 import sys
 import threading
 import time
-import Pyro5.api  # type: ignore
+import Pyro5.api
 from datetime import datetime
 
+if len(sys.argv) < 2:
+    print("Uso: python cliente_tolerante_falhas.py <SEU_ID>")
+    sys.exit(1)
 
 CLIENTE_ID = sys.argv[1]
 NOME_OBJETO_PYRO = f"cliente.exclusao_mutua.{CLIENTE_ID}"
 
 TEMPO_MAXIMO_SC = 30
-INTERVALO_HEARTBEAT = 15
-TIMEOUT_HEARTBEAT = 30
-TIMEOUT_RESPOSTA = 35
-
+HEARTBEAT_INTERVALO = 15
+HEARTBEAT_TIMEOUT = 45
+REQUEST_TIMEOUT = 10 
 
 @Pyro5.api.behavior(instance_mode="single")
 class ClienteHandle(object):
     def __init__(self):
+        self.lock = threading.Lock()
         self.status = "RELEASED"
         self.timestamp_pedido = None
         self.fila_pedidos = []
         self.respostas_recebidas = set()
         self.timer_recurso = None
-        self.start_time_sc = None
-        
+        self.peers_ativos = set()
         self.ultimo_heartbeat = {}
-        self.heartbeat_thread = None
-        self.heartbeat_running = True
-        
         self.pedidos_pendentes = {}
-        self.lock = threading.Lock()
-        
-        self.notificacoes_pendentes = []     
-        self.iniciar_heartbeat()
-        self.iniciar_processador_notificacoes()
-
-    def iniciar_heartbeat(self):
-        self.heartbeat_thread = threading.Thread(target=self.enviar_heartbeats)
-        self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
-        
-        verificador_thread = threading.Thread(target=self.verificar_heartbeats)
-        verificador_thread.daemon = True
-        verificador_thread.start()
-        
-    def iniciar_processador_notificacoes(self):
-        """Inicia thread para processar notificações pendentes periodicamente"""
-        processador_thread = threading.Thread(target=self.processar_notificacoes_periodicamente)
-        processador_thread.daemon = True
-        processador_thread.start()
-        
-    def processar_notificacoes_periodicamente(self):
-        while self.heartbeat_running:
-            time.sleep(5)
-            if self.notificacoes_pendentes:
-                thread = threading.Thread(target=self.processar_notificacoes_pendentes)
-                thread.daemon = True
-                thread.start()
-
-    def enviar_heartbeats(self):
-        while self.heartbeat_running:
-            try:
-                ns = Pyro5.api.locate_ns()
-                peers = ns.list(prefix="cliente.exclusao_mutua.")
-                peers.pop(NOME_OBJETO_PYRO, None)
-                
-                for nome_peer, uri_peer in peers.items():
-                    try:
-                        proxy_peer = Pyro5.api.Proxy(uri_peer)
-                        proxy_peer._pyroTimeout = TIMEOUT_HEARTBEAT
-                        proxy_peer.receber_heartbeat(CLIENTE_ID)
-                    except Exception as e:
-                        pass
-                        
-            except Exception as e:
-                print(f" Erro ao localizar peers para heartbeat: {e}")
-            
-            time.sleep(INTERVALO_HEARTBEAT)
-
-    def verificar_heartbeats(self):
-        while self.heartbeat_running:
-            tempo_atual = time.time()
-            peers_inativos = []
-            
-            with self.lock:
-                for peer_id, ultimo_tempo in list(self.ultimo_heartbeat.items()):
-                    if tempo_atual - ultimo_tempo > (TIMEOUT_HEARTBEAT):
-                        peers_inativos.append(peer_id)
-                        
-                for peer_id in peers_inativos:
-                    if peer_id in self.fila_pedidos:
-                        self.fila_pedidos.remove(peer_id)
-                    
-                    if peer_id in self.pedidos_pendentes:
-                        del self.pedidos_pendentes[peer_id]
-                    
-                    if peer_id in self.ultimo_heartbeat:
-                        del self.ultimo_heartbeat[peer_id]
-            
-            if peers_inativos:
-                print(f"Peers considerados inativos: {peers_inativos}")
-                
-            time.sleep(INTERVALO_HEARTBEAT)
-
-    @Pyro5.api.expose
-    def receber_heartbeat(self, peer_id):
-        print(f"Recebeu heartbeat de {peer_id}")
-        with self.lock:
-            self.ultimo_heartbeat[peer_id] = time.time()
-        return "ACK"
-
-    def peer_esta_ativo(self, peer_id):
-        with self.lock:
-            if peer_id not in self.ultimo_heartbeat:
-                return True
-            tempo_atual = time.time()
-            return (tempo_atual - self.ultimo_heartbeat[peer_id]) <= (TIMEOUT_HEARTBEAT)
 
     @Pyro5.api.expose
     def receber_pedido(self, requisitante_id, timestamp_req):
         with self.lock:
-            if self.status == "HELD" or (self.status == "WANTED" and self.timestamp_pedido < timestamp_req):
-                if requisitante_id not in self.fila_pedidos:
-                    self.fila_pedidos.append(requisitante_id)
-                return "DENIED"
+            print(f"[Thread Pyro] Recebeu pedido de {requisitante_id} com timestamp {timestamp_req}")
+            
+            if requisitante_id not in self.peers_ativos:
+                print(f"[Thread Pyro] Ignorando pedido de peer desconhecido ou inativo: {requisitante_id}")
+                return "IGNORED"
+
+            if self.status == "HELD" or (self.status == "WANTED" and (self.timestamp_pedido < timestamp_req or (self.timestamp_pedido == timestamp_req and CLIENTE_ID < requisitante_id))):
+                print(f"[Thread Pyro] Status é {self.status}. Colocando {requisitante_id} na fila.")
+                self.fila_pedidos.append(requisitante_id)
+                return "WAIT"
             else:
+                print(f"[Thread Pyro] Status é {self.status}. Respondendo 'OK' para {requisitante_id}.")
                 return "OK"
-        
-    def liberar_sc(self, automatico=False):
-        origem = "automaticamente (tempo expirou)" if automatico else "manualmente"
-        print(f"Liberando SC {origem}")
-        
-        with self.lock:
-            self.status = "RELEASED"
-            self.timestamp_pedido = None
-            self.start_time_sc = None
-            self.respostas_recebidas = set()
-            self.pedidos_pendentes = {}
-
-        self.processar_notificacoes_pendentes()
-        
-        if self.fila_pedidos:
-            try:
-                ns = Pyro5.api.locate_ns()
-                
-                fila_ativa = list(self.fila_pedidos)
-                
-                threads_notificacao = []
-                
-                for requisitante_id in fila_ativa:
-                    thread = threading.Thread(
-                        target=self.notificar_peer_async,
-                        args=(requisitante_id, ns)
-                    )
-                    thread.daemon = True
-                    thread.start()
-                    threads_notificacao.append(thread)
-                
-                for thread in threads_notificacao:
-                    thread.join(timeout=TIMEOUT_RESPOSTA)
-
-                self.fila_pedidos.clear()
-            except Exception as e:
-                print(f"Erro ao acessar name server para liberação: {e}")
-                with self.lock:
-                    for requisitante_id in self.fila_pedidos:
-                        if requisitante_id not in self.notificacoes_pendentes:
-                            self.notificacoes_pendentes.append(requisitante_id)
-                self.fila_pedidos.clear()
 
     @Pyro5.api.expose
     def receber_ok(self, remetente_id):
+        entrar_agora = False
         with self.lock:
-            self.respostas_recebidas.add(remetente_id)
-            if remetente_id in self.pedidos_pendentes:
-                del self.pedidos_pendentes[remetente_id]
-        print(f"Recebeu OK de {remetente_id}")
+            if self.status == "WANTED":
+                print(f"[Thread Pyro] Recebeu 'OK' do peer {remetente_id}.")
+                self.respostas_recebidas.add(remetente_id)
+                if remetente_id in self.pedidos_pendentes:
+                    del self.pedidos_pendentes[remetente_id]
+                
+                if self.respostas_recebidas.issuperset(self.peers_ativos):
+                    self.status = "HELD"
+                    entrar_agora = True
+        
+        if entrar_agora:
+            self.executar_entrada_sc()
+
         return "ACK"
 
-    def verificar_timeouts_respostas(self, peers_esperados):
-        tempo_atual = time.time()
-        peers_timeout = []
+    @Pyro5.api.expose
+    def receber_heartbeat(self, remetente_id):
+        with self.lock:
+            print(f"[Heartbeat] recebido de: {remetente_id}")
+            if remetente_id not in self.peers_ativos:
+                print(f"[Heartbeat] Peer novo ou reconectado detectado: {remetente_id}")
+                self.peers_ativos.add(remetente_id)
+            self.ultimo_heartbeat[remetente_id] = time.time()
+        return "ACK"
+
+    def liberar_sc(self, automatico=False):
+        with self.lock:
+            if self.status != "HELD":
+                return
+
+            origem = "automaticamente (tempo expirou)" if automatico else "manualmente"
+            print(f"\nCliente {CLIENTE_ID} saindo da SC {origem}...")
+            
+            self.status = "RELEASED"
+            self.timestamp_pedido = None
+            self.pedidos_pendentes.clear()
+
+            if not self.fila_pedidos:
+                return
+
+            print(f"Notificando {len(self.fila_pedidos)} peers na fila de espera...")
+            ns = Pyro5.api.locate_ns()
+            peers_na_fila = self.fila_pedidos[:]
+            self.fila_pedidos.clear()
+
+        for requisitante_id in peers_na_fila:
+            if requisitante_id in self.peers_ativos:
+                try:
+                    uri_peer = ns.lookup(f"cliente.exclusao_mutua.{requisitante_id}")
+                    proxy_peer = Pyro5.api.Proxy(uri_peer)
+                    proxy_peer.receber_ok(CLIENTE_ID)
+                    print(f"Notificou {requisitante_id} com 'OK'")
+                except Exception as e:
+                    print(f"Erro ao notificar {requisitante_id} (pode ter falhado): {e}")
+
+    def executar_entrada_sc(self):
+        print("\n\n[AUTO] Acesso à SC concedido!")
+        print(f"Recurso obtido. O acesso expira em {TEMPO_MAXIMO_SC} segundos.")
+        print(">>> Pressione Enter para atualizar o menu. <<<")
         
         with self.lock:
-            for peer_id in list(self.pedidos_pendentes.keys()):
-                if tempo_atual - self.pedidos_pendentes[peer_id] > TIMEOUT_RESPOSTA:
-                    if self.peer_esta_ativo(peer_id):
-                        print(f"Timeout de Resposta: Peer {peer_id} está ativo, mas ocupado. Estendendo a espera.")
-                        self.pedidos_pendentes[peer_id] = time.time()
-                    else:
-                        print(f"Timeout: Peer {peer_id} não respondeu E seu heartbeat falhou. Removendo.")
-                        peers_timeout.append(peer_id)
-                        del self.pedidos_pendentes[peer_id]
-                        if peer_id in self.respostas_recebidas:
-                            self.respostas_recebidas.remove(peer_id)
-
-        return peers_timeout
-
-    def notificar_peer_async(self, requisitante_id, ns):
-        nome_peer = f"cliente.exclusao_mutua.{requisitante_id}"
-        try:
-            print(f"Notificando {requisitante_id}...")
-            uri_peer = ns.lookup(nome_peer)
-            proxy_peer = Pyro5.api.Proxy(uri_peer)
-            proxy_peer._pyroTimeout = TIMEOUT_RESPOSTA
-            
-            proxy_peer.receber_ok(CLIENTE_ID)
-            print(f"Notificou {requisitante_id} com 'OK'")
-                        
-        except Exception as e:
-            print(f"Erro ao notificar {requisitante_id}: {e}")
-            with self.lock:
-                if requisitante_id not in self.notificacoes_pendentes:
-                    self.notificacoes_pendentes.append(requisitante_id)
-
-    def processar_notificacoes_pendentes(self):
-        if not self.notificacoes_pendentes:
-            return
-            
-        print(f"Processando {len(self.notificacoes_pendentes)} notificações pendentes...")
-        
-        try:
-            ns = Pyro5.api.locate_ns()
-            notificacoes_sucesso = []
-            
-            for requisitante_id in list(self.notificacoes_pendentes):
-                nome_peer = f"cliente.exclusao_mutua.{requisitante_id}"
-                try:
-                    print(f"Notificando {requisitante_id}...")
-                    uri_peer = ns.lookup(nome_peer)
-                    proxy_peer = Pyro5.api.Proxy(uri_peer)
-                    proxy_peer._pyroTimeout = TIMEOUT_RESPOSTA
-                    proxy_peer.receber_ok(CLIENTE_ID)
-                    
-                    print(f"Notificou {requisitante_id} com 'OK'")
-                    notificacoes_sucesso.append(requisitante_id)
-                except Exception as e:
-                    print(f"Erro ao notificar {requisitante_id}: {e}")
-            
-            with self.lock:
-                for requisitante_id in notificacoes_sucesso:
-                    if requisitante_id in self.notificacoes_pendentes:
-                        self.notificacoes_pendentes.remove(requisitante_id)
-                        
-        except Exception as e:
-            print(f"Erro ao processar notificações pendentes: {e}")
-    
-
-    def parar_heartbeat(self):
-        print("Parando threads de heartbeat...")
-        self.heartbeat_running = False
-
+            if self.timer_recurso and self.timer_recurso.is_alive():
+                self.timer_recurso.cancel()
+            self.timer_recurso = threading.Timer(TEMPO_MAXIMO_SC, self.liberar_sc, args=[True])
+            self.timer_recurso.start()
 
 def iniciar_servidor_pyro(handler):
     daemon = Pyro5.api.Daemon()
     ns = Pyro5.api.locate_ns()
     uri = daemon.register(handler)
     ns.register(NOME_OBJETO_PYRO, uri)
+    print(f"[Thread Pyro] Servidor iniciado para {NOME_OBJETO_PYRO}.")
     daemon.requestLoop()
 
+def enviar_heartbeats(handler):
+    ns = Pyro5.api.locate_ns()
+    while True:
+        time.sleep(HEARTBEAT_INTERVALO)
+        
+        with handler.lock:
+            peers_atuais = list(handler.peers_ativos)
+
+        if not peers_atuais:
+            continue
+        
+        for peer_id in peers_atuais:
+            try:
+                uri_peer = ns.lookup(f"cliente.exclusao_mutua.{peer_id}")
+                proxy_peer = Pyro5.api.Proxy(uri_peer)
+                proxy_peer.receber_heartbeat(CLIENTE_ID)
+            except Exception:
+                pass
+
+def verificar_falhas(handler):
+    while True:
+        time.sleep(HEARTBEAT_TIMEOUT / 2)
+        
+        peers_a_remover = set()
+        agora = time.time()
+        entrar_agora = False
+
+        with handler.lock:
+            for peer_id, ultimo_hb in handler.ultimo_heartbeat.items():
+                if agora - ultimo_hb > HEARTBEAT_TIMEOUT:
+                    peers_a_remover.add(peer_id)
+            
+            if peers_a_remover:
+                print(f"\n[Detector de Falhas] Peers inativos detectados: {list(peers_a_remover)}")
+                handler.peers_ativos.difference_update(peers_a_remover)
+                for peer_id in peers_a_remover:
+                    if peer_id in handler.ultimo_heartbeat:
+                        del handler.ultimo_heartbeat[peer_id]
+                    if handler.status == "WANTED":
+                        handler.respostas_recebidas.add(peer_id)
+                
+                if handler.status == "WANTED" and handler.respostas_recebidas.issuperset(handler.peers_ativos):
+                    handler.status = "HELD"
+                    entrar_agora = True
+        
+        if entrar_agora:
+            handler.executar_entrada_sc()
+
+def verificar_timeouts_de_pedido(handler):
+    while True:
+        time.sleep(REQUEST_TIMEOUT / 2)
+
+        pedidos_expirados = set()
+        entrar_agora = False
+        agora = time.time()
+
+        with handler.lock:
+            if handler.status != "WANTED":
+                continue
+
+            for peer_id, timestamp_envio in list(handler.pedidos_pendentes.items()):
+                if agora - timestamp_envio > REQUEST_TIMEOUT:
+                    pedidos_expirados.add(peer_id)
+
+            if pedidos_expirados:
+                print(f"\n[Request Timeout] Não houve resposta de {list(pedidos_expirados)} a tempo.")
+                for peer_id in pedidos_expirados:
+                    if peer_id in handler.pedidos_pendentes:
+                        del handler.pedidos_pendentes[peer_id]
+                    handler.respostas_recebidas.add(peer_id)
+
+                if handler.respostas_recebidas.issuperset(handler.peers_ativos):
+                    handler.status = "HELD"
+                    entrar_agora = True
+
+        if entrar_agora:
+            handler.executar_entrada_sc()
 
 def interface_usuario(handler):
-    time.sleep(5)
-    while True:
+    time.sleep(2)
+    ns = Pyro5.api.locate_ns()
+    
+    try:
+        todos_os_peers = ns.list(prefix="cliente.exclusao_mutua.")
+        peer_ids = {nome.split('.')[-1] for nome in todos_os_peers if nome != NOME_OBJETO_PYRO}
+        with handler.lock:
+            handler.peers_ativos.update(peer_ids)
+            for peer_id in peer_ids:
+                handler.ultimo_heartbeat[peer_id] = time.time()
+        print(f"Peers iniciais detectados: {list(peer_ids)}")
+    except Exception as e:
+        print(f"Erro ao buscar peers iniciais: {e}")
 
-        print("\n" + "="*40)
+    while True:
+        print("\n" + "="*50)
         print(f" CLIENTE: {CLIENTE_ID} | STATUS: {handler.status}")
-        print("="*40)
+        print(f" Peers Ativos Conhecidos: {sorted(list(handler.peers_ativos)) if handler.peers_ativos else 'Nenhum'}")
+        print("="*50)
         print("Opções:")
         print("  1 - Pedir para entrar na Seção Crítica (SC)")
         print("  2 - Liberar a Seção Crítica (SC)")
-        print("  3 - Ver peers ativos")
-        print("  4 - Sair")
-        print("="*40)
-
-        opcao = input("Digite uma opção: ").strip()
+        print("  3 - Sair")
+        print("="*50)
 
         try:
-            ns = Pyro5.api.locate_ns()
-            peers = ns.list(prefix="cliente.exclusao_mutua.")
-            peers.pop(NOME_OBJETO_PYRO, None)
-        except Exception as e:
-            print(f"Não foi possível contatar o Name Server: {e}")
-            continue
+            opcao = input("Digite uma opção: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            opcao = '3'
 
         if opcao == '1':
             if handler.status != "RELEASED":
-                continue
-            handler.status = "WANTED"
-            handler.timestamp_pedido = datetime.now().timestamp()
-            handler.respostas_recebidas.clear()
-            
-            peers_ativos = {nome: uri for nome, uri in peers.items() 
-                            if handler.peer_esta_ativo(nome.split('.')[-1])}
-            
-            if not peers_ativos:
-                handler.status = "HELD"
-                
-                print(f"Recurso obtido. O acesso expira em {TEMPO_MAXIMO_SC} segundos.")
-                handler.timer_recurso = threading.Timer(TEMPO_MAXIMO_SC, handler.liberar_sc, args=[True])
-                handler.start_time_sc = time.time()
-                handler.timer_recurso.start()
+                print("Ação inválida: O cliente já está na fila ou na SC.")
                 continue
 
-            print(f"Enviando pedido para {len(peers_ativos)} peers ativos: {list(p.split('.')[-1] for p in peers_ativos.keys())}")
-            
             with handler.lock:
-                for nome_peer in peers_ativos.keys():
-                    peer_id = nome_peer.split('.')[-1]
+                print(f"\nCliente {CLIENTE_ID} quer entrar na SC...")
+                handler.status = "WANTED"
+                handler.timestamp_pedido = datetime.now().timestamp()
+                handler.respostas_recebidas.clear()
+                handler.pedidos_pendentes.clear()
+                peers_para_pedir = list(handler.peers_ativos)
+
+            if not peers_para_pedir:
+                print("Nenhum outro peer ativo encontrado. Entrando na SC diretamente.")
+                with handler.lock:
+                    handler.status = "HELD"
+                handler.executar_entrada_sc()
+                continue
+
+            print(f"Enviando pedido para {len(peers_para_pedir)} peers: {peers_para_pedir}...")
+            for peer_id in peers_para_pedir:
+                with handler.lock:
                     handler.pedidos_pendentes[peer_id] = time.time()
-            
-            for nome_peer, uri_peer in peers_ativos.items():
-                peer_id = nome_peer.split('.')[-1]
+                
                 try:
-                    print(f"Enviando pedido para {peer_id}...")
+                    uri_peer = ns.lookup(f"cliente.exclusao_mutua.{peer_id}")
                     proxy_peer = Pyro5.api.Proxy(uri_peer)
-                    proxy_peer._pyroTimeout = 10
                     resposta = proxy_peer.receber_pedido(CLIENTE_ID, handler.timestamp_pedido)
                     
-                    with handler.lock:
-                        if resposta == "OK":
-                            handler.respostas_recebidas.add(peer_id)
+                    if resposta == "OK":
+                        handler.receber_ok(peer_id)
+                    elif resposta == "WAIT":
+                        print(f"Peer {peer_id} respondeu com 'WAIT'. Aguardando liberação.")
+                        with handler.lock:
                             if peer_id in handler.pedidos_pendentes:
                                 del handler.pedidos_pendentes[peer_id]
-                            print(f"Recebeu OK de {peer_id}")
-                        elif resposta == "DENIED":
-                            if peer_id in handler.pedidos_pendentes:
-                                handler.pedidos_pendentes[peer_id] = time.time()
-                            print(f"Recebeu DENIED de {peer_id}")
-
+                                
                 except Exception as e:
-                    print(f"Erro ao enviar pedido para {peer_id}: {e}")
-                    with handler.lock:
-                        if peer_id in handler.pedidos_pendentes:
-                            del handler.pedidos_pendentes[peer_id]
-                        if peer_id in handler.respostas_recebidas:
-                            handler.respostas_recebidas.remove(peer_id)
+                    print(f"Erro ao contatar {peer_id}: {e}")
             
-            tempo_inicio_espera = time.time()
-        
-            while len(handler.respostas_recebidas) < len(peers_ativos):
-                peers_timeout = handler.verificar_timeouts_respostas(list(peers_ativos.keys()))
-                
-                for peer_timeout in peers_timeout:
-                    nome_timeout = f"cliente.exclusao_mutua.{peer_timeout}"
-                    if nome_timeout in peers_ativos:
-                        del peers_ativos[nome_timeout]
-                        print(f"Removendo {peer_timeout} da lista de peers ativos devido a timeout")
-                
-                if len(peers_ativos) == 0:
-                    print("Todos os peers foram removidos por timeout. Entrando na SC.")
-                    break
-                    
-                if len(handler.respostas_recebidas) >= len(peers_ativos):
-                    break
-                    
-                print(f"Aguardando respostas... ({len(handler.respostas_recebidas)}/{len(peers_ativos)})")
-                time.sleep(1)
-                
-                if time.time() - tempo_inicio_espera > TIMEOUT_RESPOSTA:
-                    print("Timeout geral de espera atingido. Entrando na SC com peers disponíveis.")
-                    break
-
-            if handler.status == "WANTED":
-                print("Recebeu respostas suficientes. Entrando na SC!")
-                handler.status = "HELD"
-                print(f"Recurso obtido. O acesso expira em {TEMPO_MAXIMO_SC} segundos.")
-                handler.timer_recurso = threading.Timer(TEMPO_MAXIMO_SC, handler.liberar_sc, args=[True])
-                handler.start_time_sc = time.time()
-                handler.timer_recurso.start()
+            print("Aguardando respostas...")
 
         elif opcao == '2':
             if handler.status != "HELD":
-                print("Ação inválida: cliente não está na SC.")
+                print("Ação inválida: O cliente não está na SC.")
                 continue
             
             if handler.timer_recurso and handler.timer_recurso.is_alive():
-                print("Cancelando timer de liberação automática.")
                 handler.timer_recurso.cancel()
             
             handler.liberar_sc(automatico=False)
 
         elif opcao == '3':
+            print("\nSaindo do sistema...")
+            if handler.timer_recurso and handler.timer_recurso.is_alive():
+                handler.timer_recurso.cancel()
             try:
-                ns = Pyro5.api.locate_ns()
-                peers = ns.list(prefix="cliente.exclusao_mutua.")
-                peers_encontrados = False
-                for nome, uri in peers.items():
-                    if nome != NOME_OBJETO_PYRO:
-                        peer_id = nome.split('.')[-1]
-                        status_heartbeat = "ATIVO" if handler.peer_esta_ativo(peer_id) else "INATIVO"
-                        print(f"  - {peer_id} ({status_heartbeat})")
-                        peers_encontrados = True
-                
-                if not peers_encontrados:
-                    print("  Nenhum outro peer encontrado.")
-            except Pyro5.errors.NamingError:
-                print("Não foi possível localizar o Name Server.")
-
-        elif opcao == '4':
-            handler.parar_heartbeat()
-            try:
-                ns = Pyro5.api.locate_ns()
                 ns.remove(NOME_OBJETO_PYRO)
             except Exception as e:
                 print(f"Não foi possível desregistrar do Name Server: {e}")
-            break
+            sys.exit(0)
         
-        else:
+        elif opcao:
             print("Opção inválida!")
-
-
+            
 if __name__ == "__main__":
+    try:
+        Pyro5.api.locate_ns()
+    except Pyro5.errors.NamingError:
+        print("Iniciando um Name Server local...")
+        threading.Thread(target=Pyro5.nameserver.start_ns_loop, daemon=True).start()
+        time.sleep(1)
+
     cliente_handler = ClienteHandle()
-    pyro_thread = threading.Thread(target=iniciar_servidor_pyro, args=(cliente_handler,))
-    pyro_thread.daemon = True
-    pyro_thread.start()
+
+    threading.Thread(target=iniciar_servidor_pyro, args=(cliente_handler,), daemon=True).start()
+    threading.Thread(target=enviar_heartbeats, args=(cliente_handler,), daemon=True).start()
+    threading.Thread(target=verificar_falhas, args=(cliente_handler,), daemon=True).start()
+    threading.Thread(target=verificar_timeouts_de_pedido, args=(cliente_handler,), daemon=True).start()
+    
     interface_usuario(cliente_handler)
