@@ -85,7 +85,7 @@ class ClienteHandle(object):
             
             with self.lock:
                 for peer_id, ultimo_tempo in list(self.ultimo_heartbeat.items()):
-                    if tempo_atual - ultimo_tempo > (TIMEOUT_HEARTBEAT * 2):
+                    if tempo_atual - ultimo_tempo > (TIMEOUT_HEARTBEAT):
                         peers_inativos.append(peer_id)
                         
                 for peer_id in peers_inativos:
@@ -115,7 +115,7 @@ class ClienteHandle(object):
             if peer_id not in self.ultimo_heartbeat:
                 return True
             tempo_atual = time.time()
-            return (tempo_atual - self.ultimo_heartbeat[peer_id]) <= (TIMEOUT_HEARTBEAT * 2)
+            return (tempo_atual - self.ultimo_heartbeat[peer_id]) <= (TIMEOUT_HEARTBEAT)
 
     @Pyro5.api.expose
     def receber_pedido(self, requisitante_id, timestamp_req):
@@ -380,7 +380,6 @@ def interface_usuario(handler):
                             handler.respostas_recebidas.remove(peer_id)
             
             tempo_inicio_espera = time.time()
-            timeout_geral = TIMEOUT_RESPOSTA * 2 
         
             while len(handler.respostas_recebidas) < len(peers_ativos):
                 peers_timeout = handler.verificar_timeouts_respostas(list(peers_ativos.keys()))
@@ -401,7 +400,7 @@ def interface_usuario(handler):
                 print(f"Aguardando respostas... ({len(handler.respostas_recebidas)}/{len(peers_ativos)})")
                 time.sleep(1)
                 
-                if time.time() - tempo_inicio_espera > timeout_geral:
+                if time.time() - tempo_inicio_espera > TIMEOUT_RESPOSTA:
                     print("Timeout geral de espera atingido. Entrando na SC com peers disponíveis.")
                     break
 
